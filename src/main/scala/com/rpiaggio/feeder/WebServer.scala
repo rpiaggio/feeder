@@ -4,6 +4,7 @@ import java.nio.charset.StandardCharsets
 
 import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
+import akka.http.scaladsl.model.Uri.Path
 import akka.http.scaladsl.model._
 import akka.http.scaladsl.model.headers.Cookie
 import akka.http.scaladsl.server.Directives._
@@ -22,6 +23,9 @@ object WebServer {
   implicit private val materializer: ActorMaterializer = ActorMaterializer()
   // needed for the future flatMap/onComplete in the end
   implicit private val executionContext: ExecutionContext = system.dispatcher
+
+
+  private val WEBPAGE_URI = Uri("https://tickantel.com.uy/inicio/buscar_categoria?cat_id=1")
 
   private val maxRedirCount = 20
 
@@ -132,7 +136,7 @@ object WebServer {
 
                     //                    println(s"ENQUEUEING [$currentEntry]")
 
-                    if( isAvailable(output)) push(output, currentEntry) else entryQueue.enqueue(currentEntry)
+                    if (isAvailable(output)) push(output, currentEntry) else entryQueue.enqueue(currentEntry)
                     entryRemainingInstructions = None
                     currentEntry = Seq.empty[String]
                   } else {
@@ -153,11 +157,11 @@ object WebServer {
 
         setHandler(output, new OutHandler {
           override def onPull() = {
-//            println(s"ONPULL! QUEUE: ${entryQueue.length}")
+            //            println(s"ONPULL! QUEUE: ${entryQueue.length}")
 
 
             if (entryQueue.nonEmpty) {
-//              println(s"PUSHING! ${entryQueue.head}")
+              //              println(s"PUSHING! ${entryQueue.head}")
 
               push(output, entryQueue.dequeue)
             }
@@ -171,14 +175,15 @@ object WebServer {
     val parser = Flow.fromGraph(new EntryParserGraphStage(tickAntelParsePattern))
 
     val rssRender: Flow[Entry, ByteString, Any] = Flow.fromFunction { seq =>
-      ByteString("<\n" + seq.zipWithIndex.map{ case(s, i) => s"   $$${i + 1} = $s"}.mkString("\n") + "\n>\n")
+      ByteString("<\n" + seq.zipWithIndex.map { case (s, i) => s"   $$${i + 1} = $s" }.mkString("\n") + "\n>\n" +
+        Uri(seq.head).resolvedAgainst(WEBPAGE_URI) + "\n")
     }
 
     val route =
       path("hello") {
         get {
           complete(
-            requestWithRedirects(HttpRequest(uri = Uri("https://tickantel.com.uy/inicio/buscar_categoria?cat_id=1")))
+            requestWithRedirects(HttpRequest(uri = WEBPAGE_URI))
               .transform {
                 _.map { response =>
                   HttpResponse(entity = response.entity.transformDataBytes(parser.via(rssRender)))
