@@ -71,6 +71,10 @@ object WebServer {
 
   private val tickAntelParsePattern = parseParsePattern(tickAntelPattern)
 
+  final case class FeedEntry(title: String, link: String, content: String)
+
+  private val tickAntelEntryTemplate = FeedEntry("{%3} - {%2}", "{%1}", "{%4}")
+
   def main(args: Array[String]) {
     def requestWithRedirects(req: HttpRequest, count: Int = 0)(implicit system: ActorSystem, mat: Materializer): Future[HttpResponse] = {
       Http().singleRequest(req).flatMap { resp =>
@@ -174,10 +178,27 @@ object WebServer {
 
     val parser = Flow.fromGraph(new EntryParserGraphStage(tickAntelParsePattern))
 
-    val rssRender: Flow[Entry, ByteString, Any] = Flow.fromFunction { seq =>
-      ByteString("<\n" + seq.zipWithIndex.map { case (s, i) => s"   $$${i + 1} = $s" }.mkString("\n") + "\n>\n" +
-        Uri(seq.head).resolvedAgainst(WEBPAGE_URI) + "\n")
+    def entryCreator(entryTemplate: FeedEntry, baseUri: Uri): Flow[Entry, FeedEntry, Any] = Flow.fromFunction { seq =>
+      val parameterPattern = "\\{%(\\d+)\\}".r
+
+      def replace(template: String): String = {
+        val r =
+        parameterPattern.replaceAllIn(template, mtch => seq(mtch.group(1).toInt - 1))
+        println(r)
+        r
+      }
+
+      FeedEntry(replace(entryTemplate.title), Uri(replace(entryTemplate.link)).resolvedAgainst(baseUri).toString, replace(entryTemplate.content))
     }
+
+    val formatter = entryCreator(tickAntelEntryTemplate, WEBPAGE_URI)
+
+    val rssRender: Flow[FeedEntry, ByteString, Any] = Flow.fromFunction {entry => ByteString(entry.toString + "\n")}
+
+//      seq =>
+//      ByteString("<\n" + seq.zipWithIndex.map { case (s, i) => s"   $$${i + 1} = $s" }.mkString("\n") + "\n>\n" +
+//        Uri(seq.head).resolvedAgainst(WEBPAGE_URI) + "\n")
+//    }
 
     val route =
       path("hello") {
@@ -186,7 +207,7 @@ object WebServer {
             requestWithRedirects(HttpRequest(uri = WEBPAGE_URI))
               .transform {
                 _.map { response =>
-                  HttpResponse(entity = response.entity.transformDataBytes(parser.via(rssRender)))
+                  HttpResponse(entity = response.entity.transformDataBytes(parser.via(formatter).via(rssRender).log("Feeder")))
                 }
               }
           )
