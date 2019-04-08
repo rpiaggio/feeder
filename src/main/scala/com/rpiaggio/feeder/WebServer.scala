@@ -100,13 +100,13 @@ object WebServer {
 
         var entryQueue = mutable.Queue.empty[Entry]
 
+        var previousBuffer: ByteString = ByteString.empty
+
         setHandler(input, new InHandler {
           override def onPush(): Unit = {
-            val bytes = grab(input)
+            val bytes = previousBuffer ++ grab(input)
 
-            // Here we should prepend the slice of shunk stored in (*)
-
-            //            println(s"INHANDLER! $bytes")
+            //            println(s"ONPUSH! $bytes")
 
 
             def parseChunk(lastIndex: Int = 0): Unit = {
@@ -146,7 +146,7 @@ object WebServer {
                   parseChunk(nextIndex + currentInstruction.until.length)
                 }
               } else {
-                // (*) Here we should store in state the current chunk from lastIndex
+                previousBuffer = bytes.drop(lastIndex)
               }
             }
 
