@@ -1,17 +1,19 @@
 package com.rpiaggio.feeder
 
-import java.nio.charset.{Charset, StandardCharsets}
+import java.nio.charset.StandardCharsets
 
 import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.model._
 import akka.http.scaladsl.model.headers.Cookie
 import akka.http.scaladsl.server.Directives._
-import akka.stream.{ActorMaterializer, Materializer}
-import akka.stream.scaladsl.Flow
+import akka.stream.{ActorMaterializer, Attributes, FlowShape, Inlet, Materializer, Outlet}
+import akka.stream.scaladsl._
+import akka.stream.stage.{GraphStage, GraphStageLogic, InHandler, OutHandler}
 import akka.util.ByteString
 import enumeratum._
 
+import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future}
 import scala.io.StdIn
 
@@ -39,13 +41,17 @@ object WebServer {
 
   final case class ParseInstruction(action: ParseAction, until: String)
 
-  final case class ParsePattern(start: String, doingFirst: ParseInstruction, andThen: ParseInstruction*)
+  final case class ParsePattern(start: String, doingFirst: ParseInstruction, andThen: ParseInstruction*) {
+    val instructions = doingFirst +: andThen
+  }
 
   private val tickAntelPattern =
     """<div class="item">{*}
       |href="{%}"{*}
       |<p class="txt-upper txt-blue txt-bold">{%}</p>{*}
-      |<span class="span-block">{%}</span>{*}""".stripMargin
+      |<span class="span-block">{%}</span>{*}
+      |<p>{%}</p>{*}
+      |</div>""".stripMargin
 
   private val fakeSeparator = "<!!!!>"
   private val anyParserActionPattern = s"\\{(${ParseAction.values.map(a => s"\\${a.representation}").mkString("|")})\\}"
@@ -75,28 +81,97 @@ object WebServer {
       }
     }
 
-    case class EntryParser(pattern: ParsePattern) {
 
-      var mode = 0 // 0 initing, 1 capturing
+    class EntryParserGraphStage(pattern: ParsePattern) extends GraphStage[FlowShape[ByteString, Entry]] {
+      val input = Inlet[ByteString]("EntryParser.in")
+      val output = Outlet[Entry]("EntryParser.out")
 
-      var current = Seq.empty[String]
+      override def shape: FlowShape[ByteString, Entry] = FlowShape(input, output)
 
-      println(pattern.start)
+      override def createLogic(inheritedAttributes: Attributes): GraphStageLogic = new GraphStageLogic(shape) {
 
-      def parse: Flow[ByteString, Seq[String], Any] = Flow.fromFunction { bytes =>
-        println(bytes)
-        println(new String(bytes.toArray, StandardCharsets.UTF_8))
+        var entryRemainingInstructions: Option[Seq[ParseInstruction]] = None
+
+        var currentEntry: Entry = Seq.empty[String]
+
+        var entryQueue = mutable.Queue.empty[Entry]
+
+        setHandler(input, new InHandler {
+          override def onPush(): Unit = {
+            val bytes = grab(input)
+
+            // Here we should prepend the slice of shunk stored in (*)
+
+            //            println(s"INHANDLER! $bytes")
 
 
+            def parseChunk(lastIndex: Int = 0): Unit = {
 
-        Seq(bytes.indexOfSlice(pattern.start.getBytes(StandardCharsets.UTF_8)).toString)
 
-//        current
+              //              println(s"parseChunk($lastIndex) - entryRemainingInstructions [$entryRemainingInstructions] - currentEntry [$currentEntry]")
+
+
+              val nextString = entryRemainingInstructions.fold(pattern.start)(_.head.until)
+              val nextIndex = bytes.indexOfSlice(nextString.getBytes(StandardCharsets.UTF_8), lastIndex)
+
+              if (nextIndex >= 0) {
+
+                //                println(s"FOUND! nextIndex [$nextIndex]")
+
+                entryRemainingInstructions.fold {
+                  entryRemainingInstructions = Some(pattern.instructions)
+                  parseChunk(nextIndex + pattern.start.length)
+                } { instructions =>
+                  val currentInstruction = instructions.head
+                  if (currentInstruction.action == ParseAction.Capture) {
+                    currentEntry = currentEntry :+ new String(bytes.slice(lastIndex, nextIndex).toArray, StandardCharsets.UTF_8).replaceAll("\n\r", "")
+                  }
+
+                  val remainingInstructions = instructions.tail
+                  if (remainingInstructions.isEmpty) {
+
+                    //                    println(s"ENQUEUEING [$currentEntry]")
+
+                    if( isAvailable(output)) push(output, currentEntry) else entryQueue.enqueue(currentEntry)
+                    entryRemainingInstructions = None
+                    currentEntry = Seq.empty[String]
+                  } else {
+                    entryRemainingInstructions = Some(remainingInstructions)
+                  }
+
+                  parseChunk(nextIndex + currentInstruction.until.length)
+                }
+              } else {
+                // (*) Here we should store in state the current chunk from lastIndex
+              }
+            }
+
+            parseChunk()
+            if (!hasBeenPulled(input)) pull(input)
+          }
+        })
+
+        setHandler(output, new OutHandler {
+          override def onPull() = {
+//            println(s"ONPULL! QUEUE: ${entryQueue.length}")
+
+
+            if (entryQueue.nonEmpty) {
+//              println(s"PUSHING! ${entryQueue.head}")
+
+              push(output, entryQueue.dequeue)
+            }
+            if (!hasBeenPulled(input)) pull(input)
+          }
+        })
       }
+
     }
 
-    val rssRender: Flow[Seq[String], ByteString, Any] = Flow.fromFunction { seq =>
-      ByteString(seq.mkString("<", ",", ">\n"))
+    val parser = Flow.fromGraph(new EntryParserGraphStage(tickAntelParsePattern))
+
+    val rssRender: Flow[Entry, ByteString, Any] = Flow.fromFunction { seq =>
+      ByteString("<\n" + seq.zipWithIndex.map{ case(s, i) => s"   $$${i + 1} = $s"}.mkString("\n") + "\n>\n")
     }
 
     val route =
@@ -106,7 +181,7 @@ object WebServer {
             requestWithRedirects(HttpRequest(uri = Uri("https://tickantel.com.uy/inicio/buscar_categoria?cat_id=1")))
               .transform {
                 _.map { response =>
-                  HttpResponse(entity = response.entity.transformDataBytes(EntryParser(tickAntelParsePattern).parse.via(rssRender)))
+                  HttpResponse(entity = response.entity.transformDataBytes(parser.via(rssRender)))
                 }
               }
           )
