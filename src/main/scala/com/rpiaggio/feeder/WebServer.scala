@@ -4,7 +4,6 @@ import java.nio.charset.StandardCharsets
 
 import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
-import akka.http.scaladsl.model.Uri.Path
 import akka.http.scaladsl.model._
 import akka.http.scaladsl.model.headers.Cookie
 import akka.http.scaladsl.server.Directives._
@@ -13,24 +12,22 @@ import akka.stream.scaladsl._
 import akka.stream.stage.{GraphStage, GraphStageLogic, InHandler, OutHandler}
 import akka.util.ByteString
 import enumeratum._
+import org.jsoup.Jsoup
 
 import scala.collection.mutable
-import scala.collection.parallel.immutable
 import scala.concurrent.{ExecutionContext, Future}
 import scala.io.StdIn
 
 object WebServer {
-  implicit private val system: ActorSystem = ActorSystem("my-system")
+  implicit private val system: ActorSystem = ActorSystem("feeder-system")
   implicit private val materializer: ActorMaterializer = ActorMaterializer()
   // needed for the future flatMap/onComplete in the end
   implicit private val executionContext: ExecutionContext = system.dispatcher
 
 
-  private val WEBPAGE_URL = "https://tickantel.com.uy/inicio/buscar_categoria?cat_id=1"
-
   private val maxRedirCount = 20
 
-  type Entry = Seq[String]
+  type EntryData = Seq[String]
 
   sealed abstract class ParseAction(val representation: String) extends EnumEntry
 
@@ -93,19 +90,19 @@ object WebServer {
     }
 
 
-    class EntryParserGraphStage(pattern: ParsePattern) extends GraphStage[FlowShape[ByteString, Entry]] {
+    class EntryParserGraphStage(pattern: ParsePattern) extends GraphStage[FlowShape[ByteString, EntryData]] {
       val input = Inlet[ByteString]("EntryParser.in")
-      val output = Outlet[Entry]("EntryParser.out")
+      val output = Outlet[EntryData]("EntryParser.out")
 
-      override def shape: FlowShape[ByteString, Entry] = FlowShape(input, output)
+      override def shape: FlowShape[ByteString, EntryData] = FlowShape(input, output)
 
       override def createLogic(inheritedAttributes: Attributes): GraphStageLogic = new GraphStageLogic(shape) {
 
         var entryRemainingInstructions: Option[Seq[ParseInstruction]] = None
 
-        var currentEntry: Entry = Seq.empty[String]
+        var currentEntry: EntryData = Seq.empty[String]
 
-        var entryQueue = mutable.Queue.empty[Entry]
+        var entryQueue = mutable.Queue.empty[EntryData]
 
         var previousBuffer: ByteString = ByteString.empty
 
@@ -113,22 +110,11 @@ object WebServer {
           override def onPush(): Unit = {
             val bytes = previousBuffer ++ grab(input)
 
-            //            println(s"ONPUSH! $bytes")
-
-
             def parseChunk(lastIndex: Int = 0): Unit = {
-
-
-              //              println(s"parseChunk($lastIndex) - entryRemainingInstructions [$entryRemainingInstructions] - currentEntry [$currentEntry]")
-
-
               val nextString = entryRemainingInstructions.fold(pattern.start)(_.head.until)
               val nextIndex = bytes.indexOfSlice(nextString.getBytes(StandardCharsets.UTF_8), lastIndex)
 
               if (nextIndex >= 0) {
-
-                //                println(s"FOUND! nextIndex [$nextIndex]")
-
                 entryRemainingInstructions.fold {
                   entryRemainingInstructions = Some(pattern.instructions)
                   parseChunk(nextIndex + pattern.start.length)
@@ -140,9 +126,6 @@ object WebServer {
 
                   val remainingInstructions = instructions.tail
                   if (remainingInstructions.isEmpty) {
-
-                    //                    println(s"ENQUEUEING [$currentEntry]")
-
                     if (isAvailable(output)) push(output, currentEntry) else entryQueue.enqueue(currentEntry)
                     entryRemainingInstructions = None
                     currentEntry = Seq.empty[String]
@@ -164,12 +147,7 @@ object WebServer {
 
         setHandler(output, new OutHandler {
           override def onPull() = {
-            //            println(s"ONPULL! QUEUE: ${entryQueue.length}")
-
-
             if (entryQueue.nonEmpty) {
-              //              println(s"PUSHING! ${entryQueue.head}")
-
               push(output, entryQueue.dequeue)
             }
             if (!hasBeenPulled(input)) pull(input)
@@ -179,25 +157,21 @@ object WebServer {
 
     }
 
-    val parser = Flow.fromGraph(new EntryParserGraphStage(tickAntelParsePattern))
-
-    def entryCreator(entryTemplate: FeedEntry, baseUri: Uri): Flow[Entry, FeedEntry, Any] = Flow.fromFunction { seq =>
+    def entryCreator(entryTemplate: FeedEntry, baseUri: Uri): Flow[EntryData, FeedEntry, Any] = Flow.fromFunction { seq =>
       val parameterPattern = "\\{%(\\d+)\\}".r
 
       def replace(template: String): String = {
-        //        val r =
         parameterPattern.replaceAllIn(template, mtch => seq(mtch.group(1).toInt - 1))
-        //        println(r)
-        //        r
       }
 
-      FeedEntry(replace(entryTemplate.title), Uri(replace(entryTemplate.link)).resolvedAgainst(baseUri).toString, replace(entryTemplate.description))
+      FeedEntry(
+        Jsoup.parse(replace(entryTemplate.title)).body.text,
+        Uri(replace(entryTemplate.link)).resolvedAgainst(baseUri).toString,
+        replace(entryTemplate.description)
+      )
     }
 
-    val formatter = entryCreator(tickAntelEntryTemplate, Uri(WEBPAGE_URL))
-
     val rssRender: Flow[FeedEntry, ByteString, Any] = Flow.fromFunction { entry =>
-
       val node =
         <item>
           <title>{entry.title}</title>
@@ -208,15 +182,18 @@ object WebServer {
       ByteString(node.toString + "\n", StandardCharsets.UTF_8)
     }
 
-    //      seq =>
-    //      ByteString("<\n" + seq.zipWithIndex.map { case (s, i) => s"   $$${i + 1} = $s" }.mkString("\n") + "\n>\n" +
-    //        Uri(seq.head).resolvedAgainst(WEBPAGE_URI) + "\n")
-    //    }
+    final case class Feed(channelEntry: FeedEntry, parsePattern: ParsePattern, entryTemplate: FeedEntry) {
+      lazy val parser = Flow.fromGraph(new EntryParserGraphStage(parsePattern))
+      lazy val formatter = entryCreator(entryTemplate, channelEntry.uri)
+    }
 
-    final case class Feed(channelEntry: FeedEntry, parsePattern: ParsePattern, entryTemplate: FeedEntry)
+    val tickAntelMusicaFeed = Feed(FeedEntry("TickAntel Música", "https://tickantel.com.uy/inicio/buscar_categoria?cat_id=1", "TickAntel Música"), tickAntelParsePattern, tickAntelEntryTemplate)
+    val tickAntelTeatroFeed = Feed(FeedEntry("TickAntel Teatro", "https://tickantel.com.uy/inicio/buscar_categoria?cat_id=2", "TickAntel Teatro"), tickAntelParsePattern, tickAntelEntryTemplate)
 
-    val tickAntelFeed = Feed(FeedEntry("TickAntel Música", WEBPAGE_URL, "Upcoming shows"), tickAntelParsePattern, tickAntelEntryTemplate)
-    // TODO Actually use Feeds
+    val feeds = Map(
+      "tickantel-musica" -> tickAntelMusicaFeed,
+      "tickantel-teatro" -> tickAntelTeatroFeed,
+    )
 
     def prefix(channelEntry: FeedEntry) =
       ByteString(
@@ -238,26 +215,27 @@ object WebServer {
       )
 
     val xmlRoute =
-      path("hello") {
+      path("feed" / Segment) { feedName =>
         get {
-          complete(
-            requestWithRedirects(HttpRequest(uri = Uri(WEBPAGE_URL)))
-              .transform {
-                _.map { response =>
-                  HttpResponse(
-                    //                    headers = List(headers.`Content-Type`(MediaTypes.`application/rss+xml`.withCharset(HttpCharsets.`UTF-8`))),
-                    entity = response.entity.transformDataBytes(
-                      parser.via(formatter).via(rssRender)
-                        .prepend(Source(List(prefix(tickAntelFeed.channelEntry))))
-                        .concat(Source(List(suffix)))
-                        .log("Feeder")
+          feeds.get(feedName).fold(failWith(new Exception(s"Unknown feed [$feedName]"))) { feed =>
+            complete(
+              requestWithRedirects(HttpRequest(uri = feed.channelEntry.uri))
+                .transform {
+                  _.map { response =>
+                    HttpResponse(
+                      // headers = List(headers.`Content-Type`(MediaTypes.`application/rss+xml`.withCharset(HttpCharsets.`UTF-8`))),
+                      entity = response.entity.transformDataBytes(
+                        feed.parser.via(feed.formatter).via(rssRender)
+                          .prepend(Source(List(prefix(feed.channelEntry))))
+                          .concat(Source(List(suffix)))
+                          .log("Feeder")
+                      ).withContentType(ContentTypes.NoContentType)
+                      //.withContentType(MediaTypes.`application/rss+xml`.withCharset(HttpCharsets.`UTF-8`))
                     )
-                      .withContentType(ContentTypes.NoContentType)
-//                    .withContentType(MediaTypes.`application/rss+xml`.withCharset(HttpCharsets.`UTF-8`))
-                  )
+                  }
                 }
-              }
-          )
+            )
+          }
         }
       }
 
