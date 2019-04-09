@@ -15,6 +15,7 @@ import akka.util.ByteString
 import enumeratum._
 
 import scala.collection.mutable
+import scala.collection.parallel.immutable
 import scala.concurrent.{ExecutionContext, Future}
 import scala.io.StdIn
 
@@ -25,7 +26,7 @@ object WebServer {
   implicit private val executionContext: ExecutionContext = system.dispatcher
 
 
-  private val WEBPAGE_URI = Uri("https://tickantel.com.uy/inicio/buscar_categoria?cat_id=1")
+  private val WEBPAGE_URL = "https://tickantel.com.uy/inicio/buscar_categoria?cat_id=1"
 
   private val maxRedirCount = 20
 
@@ -71,7 +72,9 @@ object WebServer {
 
   private val tickAntelParsePattern = parseParsePattern(tickAntelPattern)
 
-  final case class FeedEntry(title: String, link: String, content: String)
+  final case class FeedEntry(title: String, link: String, description: String) {
+    lazy val uri = Uri(link)
+  }
 
   private val tickAntelEntryTemplate = FeedEntry("{%3} - {%2}", "{%1}", "{%4}")
 
@@ -182,41 +185,93 @@ object WebServer {
       val parameterPattern = "\\{%(\\d+)\\}".r
 
       def replace(template: String): String = {
-        val r =
+        //        val r =
         parameterPattern.replaceAllIn(template, mtch => seq(mtch.group(1).toInt - 1))
-        println(r)
-        r
+        //        println(r)
+        //        r
       }
 
-      FeedEntry(replace(entryTemplate.title), Uri(replace(entryTemplate.link)).resolvedAgainst(baseUri).toString, replace(entryTemplate.content))
+      FeedEntry(replace(entryTemplate.title), Uri(replace(entryTemplate.link)).resolvedAgainst(baseUri).toString, replace(entryTemplate.description))
     }
 
-    val formatter = entryCreator(tickAntelEntryTemplate, WEBPAGE_URI)
+    val formatter = entryCreator(tickAntelEntryTemplate, Uri(WEBPAGE_URL))
 
-    val rssRender: Flow[FeedEntry, ByteString, Any] = Flow.fromFunction {entry => ByteString(entry.toString + "\n")}
+    val rssRender: Flow[FeedEntry, ByteString, Any] = Flow.fromFunction { entry =>
 
-//      seq =>
-//      ByteString("<\n" + seq.zipWithIndex.map { case (s, i) => s"   $$${i + 1} = $s" }.mkString("\n") + "\n>\n" +
-//        Uri(seq.head).resolvedAgainst(WEBPAGE_URI) + "\n")
-//    }
+      val node =
+        <item>
+          <title>{entry.title}</title>
+          <link>{entry.link}</link>
+          <description>{entry.description}</description>
+        </item>
 
-    val route =
+      ByteString(node.toString + "\n", StandardCharsets.UTF_8)
+    }
+
+    //      seq =>
+    //      ByteString("<\n" + seq.zipWithIndex.map { case (s, i) => s"   $$${i + 1} = $s" }.mkString("\n") + "\n>\n" +
+    //        Uri(seq.head).resolvedAgainst(WEBPAGE_URI) + "\n")
+    //    }
+
+    final case class Feed(channelEntry: FeedEntry, parsePattern: ParsePattern, entryTemplate: FeedEntry)
+
+    val tickAntelFeed = Feed(FeedEntry("TickAntel Música", WEBPAGE_URL, "Upcoming shows"), tickAntelParsePattern, tickAntelEntryTemplate)
+    // TODO Actually use Feeds
+
+    def prefix(channelEntry: FeedEntry) =
+      ByteString(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+          "<?xml-stylesheet type=\"text/xsl\" href=\"/xsl\"?>\n" +
+          "<rss version=\"2.0\">\n" +
+          "<channel>\n" +
+          <title>{channelEntry.title}</title>.toString +
+          <link>{channelEntry.link}</link>.toString +
+          <description>{channelEntry.description}</description>.toString + "\n",
+        StandardCharsets.UTF_8
+      )
+
+    val suffix =
+      ByteString(
+        "</channel>\n" +
+          "</rss>",
+        StandardCharsets.UTF_8
+      )
+
+    val xmlRoute =
       path("hello") {
         get {
           complete(
-            requestWithRedirects(HttpRequest(uri = WEBPAGE_URI))
+            requestWithRedirects(HttpRequest(uri = Uri(WEBPAGE_URL)))
               .transform {
                 _.map { response =>
-                  HttpResponse(entity = response.entity.transformDataBytes(parser.via(formatter).via(rssRender).log("Feeder")))
+                  HttpResponse(
+                    //                    headers = List(headers.`Content-Type`(MediaTypes.`application/rss+xml`.withCharset(HttpCharsets.`UTF-8`))),
+                    entity = response.entity.transformDataBytes(
+                      parser.via(formatter).via(rssRender)
+                        .prepend(Source(List(prefix(tickAntelFeed.channelEntry))))
+                        .concat(Source(List(suffix)))
+                        .log("Feeder")
+                    )
+                      .withContentType(ContentTypes.NoContentType)
+//                    .withContentType(MediaTypes.`application/rss+xml`.withCharset(HttpCharsets.`UTF-8`))
+                  )
                 }
               }
           )
-          //              Http().singleRequest(uri = Uri("https://tickantel.com.uy/inicio/buscar_categoria?0&cat_id=1"))
-          //    complete(HttpEntity(ContentTypes.`text/html(UTF-8)`, "<h1>Say hello to akka-http</h1>"))
         }
       }
 
-    val bindingFuture = Http().bindAndHandle(route, "localhost", 8080)
+    val xslRoute =
+      path("xsl") {
+        getFromResource("preview.xsl")
+      }
+
+    val cssRoute =
+      path("css") {
+        getFromResource("style.css")
+      }
+
+    val bindingFuture = Http().bindAndHandle(xmlRoute ~ xslRoute ~ cssRoute, "localhost", 8080)
 
     println(s"Server online at http://localhost:8080/\nPress RETURN to stop...")
     StdIn.readLine() // let it run until user presses return
