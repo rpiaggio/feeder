@@ -1,0 +1,25 @@
+service: feeder
+
+provider:
+  name: aws
+  runtime: java8
+  region: us-west-2
+  stage: dev
+
+package:
+  artifact: target/scala-2.12/feeder-assembly-0.1.jar
+
+functions:
+  api:
+    handler: com.rpiaggio.feeder.WebServer$EntryPoint::handle
+    events:
+      - http:
+          path: "{proxy+}"
+          method: get
+          cors: true
+#      Uncomment below to keep the application warm
+#      - schedule:
+#          rate: rate(4 minutes)
+#          input:
+#            httpMethod: GET
+#            path: /hello/keepWarm
