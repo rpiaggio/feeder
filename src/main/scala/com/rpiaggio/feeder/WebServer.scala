@@ -248,63 +248,6 @@ object WebServer {
       }
     }
 
-  val debugRoute1 =
-    path("debug1") {
-      get {
-        val feed = feeds.head._2
-        complete(
-          requestWithRedirects(HttpRequest(uri = feed.channelEntry.uri))
-            .transform {
-              _.map { response => HttpResponse(entity = response.entity) }
-            }
-        )
-      }
-    }
-
-  val debugRoute2 =
-    path("debug2") {
-      get {
-        val feed = feeds.head._2
-        complete(
-          requestWithRedirects(HttpRequest(uri = feed.channelEntry.uri))
-            .transform {
-              _.map { response =>
-                HttpResponse(
-                  entity = response.entity
-                    .transformDataBytes(
-                      feed.parser.via(Flow.fromFunction(s => ByteString(s.toString)))
-                        .recover { case t: Throwable => ByteString(t.getMessage + "\n" + t.getStackTrace.mkString("\n")) }
-                        .log("Feeder")
-                    ).withContentType(ContentTypes.NoContentType)
-                )
-              }
-            }
-        )
-      }
-    }
-
-  val debugRoute3 =
-    path("debug3") {
-      get {
-        val feed = feeds.head._2
-        complete(
-          requestWithRedirects(HttpRequest(uri = feed.channelEntry.uri))
-            .transform {
-              _.map { response =>
-                HttpResponse(
-                  entity = response.entity
-                    .transformDataBytes(
-                      feed.parser.via(feed.formatter).via(Flow.fromFunction(s => ByteString(s.toString)))
-                        .recover { case t: Throwable => ByteString(t.getMessage + "\n" + t.getStackTrace.mkString("\n")) }
-                        .log("Feeder")
-                    ).withContentType(ContentTypes.NoContentType)
-                )
-              }
-            }
-        )
-      }
-    }
-
   val xslRoute =
     path("xsl") {
       getFromResource("preview.xsl")
@@ -315,7 +258,7 @@ object WebServer {
       getFromResource("style.css")
     }
 
-  val router = xmlRoute ~ xslRoute ~ cssRoute ~ debugRoute1 ~ debugRoute2 ~ debugRoute3
+  val router = xmlRoute ~ xslRoute ~ cssRoute
 
 
   def main(args: Array[String]) {
