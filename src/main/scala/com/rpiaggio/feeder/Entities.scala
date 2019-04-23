@@ -39,12 +39,18 @@ object ParsePattern {
 }
 
 final case class FeedEntry(title: String, link: String, description: String) {
-  lazy val uri = Uri(link)
+  lazy val uris: Stream[Uri] =
+    if (link.contains("$page"))
+      Stream(1 to PAGES_REQUEST:_*).map{page =>
+        Uri(link.replace("$page", page.toString))
+      }
+    else
+      Stream(Uri(link))
 }
 
 final case class Feed(channelEntry: FeedEntry, parsePattern: ParsePattern, entryTemplate: FeedEntry) {
   lazy val parser: Flow[ByteString, EntryData, NotUsed] = Flow.fromGraph(new EntryParser(parsePattern))
-  lazy val formatter: Flow[EntryData, FeedEntry, Any] = Flow.fromFunction(new EntryCreator(entryTemplate, channelEntry.uri))
+  lazy val formatter: Flow[EntryData, FeedEntry, Any] = Flow.fromFunction(new EntryCreator(entryTemplate, channelEntry.uris.head))
 }
 
 trait FeedList {

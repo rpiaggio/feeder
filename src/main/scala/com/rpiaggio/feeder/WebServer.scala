@@ -22,8 +22,6 @@ object WebServer {
   // needed for the future flatMap/onComplete in the end
   implicit private val executionContext: ExecutionContext = system.dispatcher
 
-  private val maxRedirCount = 20
-
   def requestWithRedirects(req: HttpRequest, count: Int = 0)(implicit system: ActorSystem, mat: Materializer): Future[HttpResponse] = {
     //    println(s"Requesting [$req.uri]")
     val result =
@@ -34,7 +32,7 @@ object WebServer {
             resp.header[headers.Location].map { loc =>
               val cookie = resp.header[headers.`Set-Cookie`].map(header => Cookie(header.cookie.pair))
               val newReq = req.copy(uri = loc.uri, headers = req.headers ++ cookie)
-              if (count < maxRedirCount) requestWithRedirects(newReq, count + 1) else Http().singleRequest(newReq)
+              if (count < MAX_REDIR_COUNT) requestWithRedirects(newReq, count + 1) else Http().singleRequest(newReq)
             }.getOrElse(throw new RuntimeException(s"location not found on redirect for ${req.uri}"))
           case _ => Future(resp)
         }
@@ -78,13 +76,16 @@ object WebServer {
       StandardCharsets.UTF_8
     )
 
-  def feedSource(feed: Feed): Future[Source[FeedEntry, Any]] =
-    requestWithRedirects(HttpRequest(uri = feed.channelEntry.uri))
-      .transform {
-        _.map { response =>
-          response.entity.dataBytes.via(feed.parser).via(feed.formatter)
+//  def feedSource(feed: Feed): Future[Source[FeedEntry, Any]] =
+  def feedSource(feed: Feed): Source[FeedEntry, Any] =
+    Source(feed.channelEntry.uris).mapAsync(3) { uri =>
+      requestWithRedirects(HttpRequest(uri = uri))
+        .transform {
+          _.map { response =>
+            response.entity.dataBytes.via(feed.parser).via(feed.formatter).async
+          }
         }
-      }
+    }.flatMapConcat(identity)
 
   def responseFromSource(channelEntry: FeedEntry)(source: Source[FeedEntry, Any]): HttpResponse =
     HttpResponse(
@@ -97,7 +98,7 @@ object WebServer {
       )
     )
 
-
+/*
   val allRoute =
     path("all") {
       get {
@@ -109,13 +110,13 @@ object WebServer {
             .map(responseFromSource(FeedEntry("Feeder Merged Feed", "http://feeder/all", "Feeder Merged Feed")))
         )
       }
-    }
+    }*/
 
   val xmlRoute =
     path("feed" / Segment) { feedName =>
       get {
         AllFeeds.feeds.get(feedName).fold(complete(s"Unknown stream [$feedName].")) { feed =>
-          complete(feedSource(feed).map(responseFromSource(feed.channelEntry)))
+          complete(responseFromSource(feed.channelEntry)(feedSource(feed)))
         }
       }
     }
