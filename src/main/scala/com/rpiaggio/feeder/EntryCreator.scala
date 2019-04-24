@@ -9,7 +9,7 @@ class EntryCreator(entryTemplate: FeedEntry, baseUri: Uri) extends Function1[Ent
 
   override def apply(seq: EntryData) = {
     def replace(template: String): String = {
-      parameterPattern.replaceAllIn(template, mtch => seq(mtch.group(1).toInt - 1))
+      parameterPattern.replaceAllIn(template, mtch => seq(mtch.group(1).toInt - 1).trim)
     }
 
     FeedEntry(

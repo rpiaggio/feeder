@@ -82,7 +82,10 @@ object WebServer {
       requestWithRedirects(HttpRequest(uri = uri))
         .transform {
           _.map { response =>
-            response.entity.dataBytes.via(feed.parser).via(feed.formatter).async
+            response.entity.dataBytes.via(feed.parser).via(feed.formatter).async.recover{
+              case t: Throwable => t.printStackTrace()
+                FeedEntry("ERROR", "", t.getMessage)
+            }
           }
         }
     }.flatMapConcat(identity)
